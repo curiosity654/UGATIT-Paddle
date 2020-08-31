@@ -1,5 +1,5 @@
 from scipy import misc
-import os, cv2, torch
+import os, cv2
 import paddle.fluid as fluid
 import paddle.fluid.layers as layers
 import numpy as np

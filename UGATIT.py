@@ -7,6 +7,8 @@ from glob import glob
 import paddle.fluid as fluid
 import paddle.fluid.layers as layers
 import paddle.fluid.optimizer as optimizer
+from visualdl import LogWriter
+import os
 
 class UGATIT(object) :
     def __init__(self, args):
@@ -22,6 +24,7 @@ class UGATIT(object) :
         self.dataset = args.dataset
 
         self.iteration = args.iteration
+        self.start_iter_arg = args.start_iter
         self.decay_flag = args.decay_flag
 
         self.batch_size = args.batch_size
@@ -50,11 +53,6 @@ class UGATIT(object) :
         self.device = args.device
         self.benchmark_flag = args.benchmark_flag
         self.resume = args.resume
-
-        # TODO
-        if torch.backends.cudnn.enabled and self.benchmark_flag:
-            print('set benchmark !')
-            torch.backends.cudnn.benchmark = True
 
         print()
 
@@ -105,10 +103,10 @@ class UGATIT(object) :
             transforms.ToTensor()
         ]
 
-        self.trainA = os.path.join('dataset', self.dataset, 'trainA')
-        self.trainB = os.path.join('dataset', self.dataset, 'trainB')
-        self.testA = os.path.join('dataset', self.dataset, 'testA')
-        self.testB = os.path.join('dataset', self.dataset, 'testB')
+        self.trainA = os.path.join('UGATIT-Paddle/dataset', self.dataset, 'trainA')
+        self.trainB = os.path.join('UGATIT-Paddle/dataset', self.dataset, 'trainB')
+        self.testA = os.path.join('UGATIT-Paddle/dataset', self.dataset, 'testA')
+        self.testB = os.path.join('UGATIT-Paddle/dataset', self.dataset, 'testB')
         self.trainA_loader = DataLoader(self.trainA, batch_size=self.batch_size, transforms=train_transform, shuffle=True)
         self.trainB_loader = DataLoader(self.trainB, batch_size=self.batch_size, transforms=train_transform, shuffle=True)
         self.testA_loader = DataLoader(self.testA, batch_size=1, transforms=test_transform, shuffle=False)
@@ -125,52 +123,51 @@ class UGATIT(object) :
         """ Define Loss """
         self.L1_loss = dygraph.L1Loss()
         self.MSE_loss = layers.mse_loss
-        self.BCELoss = bce_Loss
+        self.BCELoss = bce_loss
         # BCELoss should be called with Normalize=True, use seperately
 
         """ Trainer """
-        self.G_optim = optimizer.Adam(learning_rate=self.lr, beta1=0.5, beta2=0.999, parameter_list=itertools.chain(self.genA2B.parameters(), self.genB2A.parameters()), regularization=fluid.regularizer.L1Decay(self.weight_decay))
-        # self.G_optim = torch.optim.Adam(itertools.chain(self.genA2B.parameters(), self.genB2A.parameters()), lr=self.lr, betas=(0.5, 0.999), weight_decay=self.weight_decay)
-        self.D_optim = optimizer.Adam(learning_rate=self.lr, beta1=0.5, beta2=0.999, parameter_list=itertools.chain(self.disGA.parameters(), self.disLB.parameters()), regularization=fluid.regularizer.L1Decay(self.weight_decay))
-        # self.D_optim = torch.optim.Adam(itertools.chain(self.disGA.parameters(), self.disGB.parameters(), self.disLA.parameters(), self.disLB.parameters()), lr=self.lr, betas=(0.5, 0.999), weight_decay=self.weight_decay)
-
-        """ Define Rho clipper to constraint the value of rho in AdaILN and ILN"""
-        self.Rho_clipper = RhoClipper(0, 1)
+        self.G_optim = optimizer.Adam(learning_rate=self.lr, beta1=0.5, beta2=0.999, parameter_list=self.genA2B.parameters()+self.genB2A.parameters())
+        # self.G_optim = optimizer.Adam(learning_rate=self.lr, beta1=0.5, beta2=0.999, parameter_list=self.genA2B.parameters()+self.genB2A.parameters(), regularization=fluid.regularizer.L1Decay(self.weight_decay))
+        self.D_optim = optimizer.Adam(learning_rate=self.lr, beta1=0.5, beta2=0.999, parameter_list=self.disGA.parameters()+self.disLB.parameters())
+        # self.D_optim = optimizer.Adam(learning_rate=self.lr, beta1=0.5, beta2=0.999, parameter_list=self.disGA.parameters()+self.disLB.parameters(), regularization=fluid.regularizer.L1Decay(self.weight_decay))
 
     def train(self):
-        self.genA2B.train(), self.genB2A.train(), self.disGA.train(), self.disGB.train(), self.disLA.train(), self.disLB.train()
-
-        start_iter = 1
+        d_loss_writer = LogWriter(logdir="./log/UGATIT/train")
+        g_loss_writer = LogWriter(logdir="./log/UGATIT/train")
+        self.start_iter = 1
         # TODO 恢复训练还没研究过
-        # if self.resume:
-        #     # glob 返回符合xxxx.pt的文件路径
-        #     model_list = glob(os.path.join(self.result_dir, self.dataset, 'model', '*.pt'))
-        #     if not len(model_list) == 0:
-        #         model_list.sort()
-        #         start_iter = int(model_list[-1].split('_')[-1].split('.')[0])
-        #         self.load(os.path.join(self.result_dir, self.dataset, 'model'), start_iter)
-        #         print(" [*] Load SUCCESS")
-        #         if self.decay_flag and start_iter > (self.iteration // 2):
-        #             self.G_optim.param_groups[0]['lr'] -= (self.lr / (self.iteration // 2)) * (start_iter - self.iteration // 2)
-        #             self.D_optim.param_groups[0]['lr'] -= (self.lr / (self.iteration // 2)) * (start_iter - self.iteration // 2)
+        if self.resume:
+            self.load(os.path.join(self.result_dir, self.dataset, 'model'), self.start_iter_arg, True)
+            # glob 返回符合xxxx.pt的文件路径
+            # model_list = glob(os.path.join(self.result_dir, self.dataset, 'model', '*.pt'))
+            # if not len(model_list) == 0:
+            #     model_list.sort()
+            #     start_iter = int(model_list[-1].split('_')[-1].split('.')[0])
+            #     self.load(os.path.join(self.result_dir, self.dataset, 'model'), start_iter)
+            #     print(" [*] Load SUCCESS")
+            #     if self.decay_flag and start_iter > (self.iteration // 2):
+            #         self.G_optim.param_groups[0]['lr'] -= (self.lr / (self.iteration // 2)) * (start_iter - self.iteration // 2)
+            #         self.D_optim.param_groups[0]['lr'] -= (self.lr / (self.iteration // 2)) * (start_iter - self.iteration // 2)
 
         # training loop
         print('training start !')
         start_time = time.time()
-        for step in range(start_iter, self.iteration + 1):
+        for step in range(self.start_iter, self.iteration + 1):
+            self.genA2B.train(), self.genB2A.train(), self.disGA.train(), self.disGB.train(), self.disLA.train(), self.disLB.train()
             # TODO decay
             # if self.decay_flag and step > (self.iteration // 2):
             #     self.G_optim.param_groups[0]['lr'] -= (self.lr / (self.iteration // 2))
             #     self.D_optim.param_groups[0]['lr'] -= (self.lr / (self.iteration // 2))
 
             try:
-                real_A, _ = next(trainA_iter)
+                real_A, _ = next(trainA_iter)[0]
             except:
                 trainA_iter = self.trainA_loader()
                 real_A, _ = next(trainA_iter)[0]
 
             try:
-                real_B, _ = next(trainB_iter)
+                real_B, _ = next(trainB_iter)[0]
             except:
                 trainB_iter = self.trainB_loader()
                 real_B, _ = next(trainB_iter)[0]
@@ -241,8 +238,8 @@ class UGATIT(object) :
             G_identity_loss_A = self.L1_loss(fake_A2A, real_A)
             G_identity_loss_B = self.L1_loss(fake_B2B, real_B)
 
-            G_cam_loss_A = self.BCE_loss(fake_B2A_cam_logit, layers.ones_like(fake_B2A_cam_logit), ) + self.BCE_loss(fake_A2A_cam_logit, layers.zeros_like(fake_A2A_cam_logit))
-            G_cam_loss_B = self.BCE_loss(fake_A2B_cam_logit, layers.ones_like(fake_A2B_cam_logit)) + self.BCE_loss(fake_B2B_cam_logit, layers.zeros_like(fake_B2B_cam_logit))
+            G_cam_loss_A = self.BCELoss(fake_B2A_cam_logit, layers.ones_like(fake_B2A_cam_logit)) + self.BCELoss(fake_A2A_cam_logit, layers.zeros_like(fake_A2A_cam_logit))
+            G_cam_loss_B = self.BCELoss(fake_A2B_cam_logit, layers.ones_like(fake_A2B_cam_logit)) + self.BCELoss(fake_B2B_cam_logit, layers.zeros_like(fake_B2B_cam_logit))
 
             G_loss_A =  self.adv_weight * (G_ad_loss_GA + G_ad_cam_loss_GA + G_ad_loss_LA + G_ad_cam_loss_LA) + self.cycle_weight * G_recon_loss_A + self.identity_weight * G_identity_loss_A + self.cam_weight * G_cam_loss_A
             G_loss_B = self.adv_weight * (G_ad_loss_GB + G_ad_cam_loss_GB + G_ad_loss_LB + G_ad_cam_loss_LB) + self.cycle_weight * G_recon_loss_B + self.identity_weight * G_identity_loss_B + self.cam_weight * G_cam_loss_B
@@ -252,9 +249,11 @@ class UGATIT(object) :
             self.G_optim.minimize(Generator_loss)
 
             # clip parameter of AdaILN and ILN, applied after optimizer step
-            self.genA2B.apply(self.Rho_clipper)
-            self.genB2A.apply(self.Rho_clipper)
-
+            clip_rho(self.genA2B)
+            clip_rho(self.genB2A)
+            
+            d_loss_writer.add_scalar(tag="d_loss", step=step, value=Discriminator_loss)
+            g_loss_writer.add_scalar(tag="g_loss", step=step, value=Generator_loss)
             print("[%5d/%5d] time: %4.4f d_loss: %.8f, g_loss: %.8f" % (step, self.iteration, time.time() - start_time, Discriminator_loss, Generator_loss))
             if step % self.print_freq == 0:
                 train_sample_num = 5
@@ -265,17 +264,16 @@ class UGATIT(object) :
                 self.genA2B.eval(), self.genB2A.eval(), self.disGA.eval(), self.disGB.eval(), self.disLA.eval(), self.disLB.eval()
                 for _ in range(train_sample_num):
                     try:
-                        real_A, _ = next(trainA_iter)
+                        real_A, _ = next(testA_iter)[0]
                     except:
-                        trainA_iter = iter(self.trainA_loader)
-                        real_A, _ = next(trainA_iter)
+                        testA_iter = self.testA_loader()
+                        real_A, _ = next(testA_iter)[0]
 
                     try:
-                        real_B, _ = next(trainB_iter)
+                        real_B, _ = next(testB_iter)[0]
                     except:
-                        trainB_iter = iter(self.trainB_loader)
-                        real_B, _ = next(trainB_iter)
-                    real_A, real_B = real_A, real_B
+                        testB_iter = self.testB_loader()
+                        real_B, _ = next(testB_iter)[0]
 
                     fake_A2B, _, fake_A2B_heatmap = self.genA2B(real_A)
                     fake_B2A, _, fake_B2A_heatmap = self.genB2A(real_B)
@@ -304,16 +302,17 @@ class UGATIT(object) :
 
                 for _ in range(test_sample_num):
                     try:
-                        real_A, _ = testA_iter.next()
+                        real_A, _ = next(testA_iter)[0]
                     except:
-                        testA_iter = iter(self.testA_loader)
-                        real_A, _ = testA_iter.next()
+                        testA_iter = self.testA_loader()
+                        real_A, _ = next(testA_iter)[0]
 
                     try:
-                        real_B, _ = testB_iter.next()
+                        real_B, _ = next(testB_iter)[0]
                     except:
-                        testB_iter = iter(self.testB_loader)
-                        real_B, _ = testB_iter.next()
+                        testB_iter = self.testB_loader()
+                        real_B, _ = next(testB_iter)[0]
+
                     real_A, real_B = real_A, real_B
 
                     fake_A2B, _, fake_A2B_heatmap = self.genA2B(real_A)
@@ -349,80 +348,105 @@ class UGATIT(object) :
                 self.save(os.path.join(self.result_dir, self.dataset, 'model'), step)
 
             if step % 1000 == 0:
-                params = {}
-                params['genA2B'] = self.genA2B.state_dict()
-                params['genB2A'] = self.genB2A.state_dict()
-                params['disGA'] = self.disGA.state_dict()
-                params['disGB'] = self.disGB.state_dict()
-                params['disLA'] = self.disLA.state_dict()
-                params['disLB'] = self.disLB.state_dict()
-                fluid.save_dygraph(params, os.path.join(self.result_dir, self.dataset + '_params_latest'))
+                self.save(os.path.join(self.result_dir, self.dataset, 'model'), 'latest')
+                # dir_path = os.path.join(self.result_dir, self.dataset, 'model')
+                # if os.path.isdir(dir_path):
+                #     os.mkdir(os.path.join(dir_path, 'latest'))
+                # fluid.save_dygraph(self.genA2B.state_dict(), os.path.join(dir_path, 'genA2B_latest'))
+                # fluid.save_dygraph(self.genB2A.state_dict(), os.path.join(dir_path, 'genB2A_latest'))
+                # fluid.save_dygraph(self.disGA.state_dict(), os.path.join(dir_path, 'disGA_latest'))
+                # fluid.save_dygraph(self.disGB.state_dict(), os.path.join(dir_path, 'disGB_latest'))
+                # fluid.save_dygraph(self.disLA.state_dict(), os.path.join(dir_path, 'disLA_latest'))
+                # fluid.save_dygraph(self.disLB.state_dict(), os.path.join(dir_path, 'disLB_latest'))
 
     def save(self, dir, step):
-        params = {}
-        params['genA2B'] = self.genA2B.state_dict()
-        params['genB2A'] = self.genB2A.state_dict()
-        params['disGA'] = self.disGA.state_dict()
-        params['disGB'] = self.disGB.state_dict()
-        params['disLA'] = self.disLA.state_dict()
-        params['disLB'] = self.disLB.state_dict()
-        fluid.save_dygraph(params, os.path.join(dir, self.dataset + '_params_%07d' % step))
+        # dir_path = os.path.join(self.result_dir, self.dataset, 'model')
+        if os.path.isdir(dir):
+            if not os.path.isdir(os.path.join(dir, str(step))):
+                os.mkdir(os.path.join(dir, str(step)))
+        fluid.save_dygraph(self.genA2B.state_dict(), os.path.join(dir, str(step), 'genA2B_'+str(step)))
+        fluid.save_dygraph(self.genB2A.state_dict(), os.path.join(dir, str(step), 'genB2A_'+str(step)))
+        fluid.save_dygraph(self.disGA.state_dict(), os.path.join(dir, str(step), 'disGA_'+str(step)))
+        fluid.save_dygraph(self.disGB.state_dict(), os.path.join(dir, str(step), 'disGB_'+str(step)))
+        fluid.save_dygraph(self.disLA.state_dict(), os.path.join(dir, str(step), 'disLA_'+str(step)))
+        fluid.save_dygraph(self.disLB.state_dict(), os.path.join(dir, str(step), 'disLB_'+str(step)))
+        # fluid.save_dygraph(self.G_optim.state_dict(), os.path.join(dir, str(step), 'genA2B_'+str(step)))
+        # fluid.save_dygraph(self.D_optim.state_dict(), os.path.join(dir, str(step), 'disGA_'+str(step)))
 
-    def load(self, dir, step):
-        params = torch.load(os.path.join(dir, self.dataset + '_params_%07d' % step))
-        self.genA2B.load_state_dict(params['genA2B'])
-        self.genB2A.load_state_dict(params['genB2A'])
-        self.disGA.load_state_dict(params['disGA'])
-        self.disGB.load_state_dict(params['disGB'])
-        self.disLA.load_state_dict(params['disLA'])
-        self.disLB.load_state_dict(params['disLB'])
+    def load(self, dir, step, if_latest):
+        genA2B_para, _ = fluid.load_dygraph(os.path.join(dir, str(step), 'genA2B_'+str(step)))
+        genB2A_para, _ = fluid.load_dygraph(os.path.join(dir, str(step), 'genB2A_'+str(step)))
+        disGA_para, _ = fluid.load_dygraph(os.path.join(dir, str(step), 'disGA_'+str(step)))
+        disGB_para, _ = fluid.load_dygraph(os.path.join(dir, str(step), 'disGB_'+str(step)))
+        disLA_para, _ = fluid.load_dygraph(os.path.join(dir, str(step), 'disLA_'+str(step)))
+        disLB_para, _ = fluid.load_dygraph(os.path.join(dir, str(step), 'disLB_'+str(step)))
+        # G_optim_para = fluid.load_dygraph(os.path.join(dir, str(step), 'genA2B_'+str(step)))
+        # D_optim_para = fluid.load_dygraph(os.path.join(dir, str(step), 'disGA_'+str(step)))
+        self.genA2B.load_dict(genA2B_para)
+        self.genB2A.load_dict(genB2A_para)
+        self.disGA.load_dict(disGA_para)
+        self.disGB.load_dict(disGB_para)
+        self.disLA.load_dict(disLA_para)
+        self.disLB.load_dict(disLB_para)
+        if not if_latest:
+            self.start_iter = step
+        # self.G_optim.set_dict(G_optim_para)
+        # self.D_optim.set_dict(D_optim_para)
+        # params = torch.load(os.path.join(dir, self.dataset + '_params_%07d' % step))
+        # self.genA2B.load_state_dict(params['genA2B'])
+        # self.genB2A.load_state_dict(params['genB2A'])
+        # self.disGA.load_state_dict(params['disGA'])
+        # self.disGB.load_state_dict(params['disGB'])
+        # self.disLA.load_state_dict(params['disLA'])
+        # self.disLB.load_state_dict(params['disLB'])
 
-    # def test(self):
-    #     model_list = glob(os.path.join(self.result_dir, self.dataset, 'model', '*.pt'))
-    #     if not len(model_list) == 0:
-    #         model_list.sort()
-    #         iter = int(model_list[-1].split('_')[-1].split('.')[0])
-    #         self.load(os.path.join(self.result_dir, self.dataset, 'model'), iter)
-    #         print(" [*] Load SUCCESS")
-    #     else:
-    #         print(" [*] Load FAILURE")
-    #         return
+    def test(self):
+        self.load(os.path.join(self.result_dir, self.dataset, 'model'), 'latest', True)
+        # model_list = glob(os.path.join(self.result_dir, self.dataset, 'model', '*.pt'))
+        # if not len(model_list) == 0:
+        #     model_list.sort()
+        #     iter = int(model_list[-1].split('_')[-1].split('.')[0])
+        #     self.load(os.path.join(self.result_dir, self.dataset, 'model'), iter)
+        #     print(" [*] Load SUCCESS")
+        # else:
+        #     print(" [*] Load FAILURE")
+        #     return
 
-    #     self.genA2B.eval(), self.genB2A.eval()
-    #     for n, (real_A, _) in enumerate(self.testA_loader):
-    #         real_A = real_A
+        self.genA2B.eval(), self.genB2A.eval()
+        for n, sample in enumerate(self.testA_loader()):
+            real_A, _ = sample[0]
 
-    #         fake_A2B, _, fake_A2B_heatmap = self.genA2B(real_A)
+            fake_A2B, _, fake_A2B_heatmap = self.genA2B(real_A)
 
-    #         fake_A2B2A, _, fake_A2B2A_heatmap = self.genB2A(fake_A2B)
+            fake_A2B2A, _, fake_A2B2A_heatmap = self.genB2A(fake_A2B)
 
-    #         fake_A2A, _, fake_A2A_heatmap = self.genB2A(real_A)
+            fake_A2A, _, fake_A2A_heatmap = self.genB2A(real_A)
 
-    #         A2B = np.concatenate((RGB2BGR(tensor2numpy(denorm(real_A[0]))),
-    #                               cam(tensor2numpy(fake_A2A_heatmap[0]), self.img_size),
-    #                               RGB2BGR(tensor2numpy(denorm(fake_A2A[0]))),
-    #                               cam(tensor2numpy(fake_A2B_heatmap[0]), self.img_size),
-    #                               RGB2BGR(tensor2numpy(denorm(fake_A2B[0]))),
-    #                               cam(tensor2numpy(fake_A2B2A_heatmap[0]), self.img_size),
-    #                               RGB2BGR(tensor2numpy(denorm(fake_A2B2A[0])))), 0)
+            A2B = np.concatenate((RGB2BGR(tensor2numpy(denorm(real_A[0]))),
+                                  cam(tensor2numpy(fake_A2A_heatmap[0]), self.img_size),
+                                  RGB2BGR(tensor2numpy(denorm(fake_A2A[0]))),
+                                  cam(tensor2numpy(fake_A2B_heatmap[0]), self.img_size),
+                                  RGB2BGR(tensor2numpy(denorm(fake_A2B[0]))),
+                                  cam(tensor2numpy(fake_A2B2A_heatmap[0]), self.img_size),
+                                  RGB2BGR(tensor2numpy(denorm(fake_A2B2A[0])))), 0)
 
-    #         cv2.imwrite(os.path.join(self.result_dir, self.dataset, 'test', 'A2B_%d.png' % (n + 1)), A2B * 255.0)
+            cv2.imwrite(os.path.join(self.result_dir, self.dataset, 'test', 'A2B_%d.png' % (n + 1)), A2B * 255.0)
 
-    #     for n, (real_B, _) in enumerate(self.testB_loader):
-    #         real_B = real_B
+        for n, sample in enumerate(self.testB_loader()):
+            real_B, _ = sample[0]
 
-    #         fake_B2A, _, fake_B2A_heatmap = self.genB2A(real_B)
+            fake_B2A, _, fake_B2A_heatmap = self.genB2A(real_B)
 
-    #         fake_B2A2B, _, fake_B2A2B_heatmap = self.genA2B(fake_B2A)
+            fake_B2A2B, _, fake_B2A2B_heatmap = self.genA2B(fake_B2A)
 
-    #         fake_B2B, _, fake_B2B_heatmap = self.genA2B(real_B)
+            fake_B2B, _, fake_B2B_heatmap = self.genA2B(real_B)
 
-    #         B2A = np.concatenate((RGB2BGR(tensor2numpy(denorm(real_B[0]))),
-    #                               cam(tensor2numpy(fake_B2B_heatmap[0]), self.img_size),
-    #                               RGB2BGR(tensor2numpy(denorm(fake_B2B[0]))),
-    #                               cam(tensor2numpy(fake_B2A_heatmap[0]), self.img_size),
-    #                               RGB2BGR(tensor2numpy(denorm(fake_B2A[0]))),
-    #                               cam(tensor2numpy(fake_B2A2B_heatmap[0]), self.img_size),
-    #                               RGB2BGR(tensor2numpy(denorm(fake_B2A2B[0])))), 0)
+            B2A = np.concatenate((RGB2BGR(tensor2numpy(denorm(real_B[0]))),
+                                  cam(tensor2numpy(fake_B2B_heatmap[0]), self.img_size),
+                                  RGB2BGR(tensor2numpy(denorm(fake_B2B[0]))),
+                                  cam(tensor2numpy(fake_B2A_heatmap[0]), self.img_size),
+                                  RGB2BGR(tensor2numpy(denorm(fake_B2A[0]))),
+                                  cam(tensor2numpy(fake_B2A2B_heatmap[0]), self.img_size),
+                                  RGB2BGR(tensor2numpy(denorm(fake_B2A2B[0])))), 0)
 
-    #         cv2.imwrite(os.path.join(self.result_dir, self.dataset, 'test', 'B2A_%d.png' % (n + 1)), B2A * 255.0)
+            cv2.imwrite(os.path.join(self.result_dir, self.dataset, 'test', 'B2A_%d.png' % (n + 1)), B2A * 255.0)

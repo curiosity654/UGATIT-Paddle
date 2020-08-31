@@ -9,14 +9,15 @@ def parse_args():
     parser = argparse.ArgumentParser(description=desc)
     parser.add_argument('--phase', type=str, default='train', help='[train / test]')
     parser.add_argument('--use_gpu', type=bool, default=False)
-    parser.add_argument('--light', type=str2bool, default=False, help='[U-GAT-IT full version / U-GAT-IT light version]')
+    parser.add_argument('--light', type=bool, default=False, help='[U-GAT-IT full version / U-GAT-IT light version]')
     parser.add_argument('--dataset', type=str, default='YOUR_DATASET_NAME', help='dataset_name')
 
-    parser.add_argument('--iteration', type=int, default=100, help='The number of training iterations')
+    parser.add_argument('--iteration', type=int, default=10000, help='The number of training iterations')
+    parser.add_argument('--start_iter', type=int, default=1000, help='The number of start iteration')
     parser.add_argument('--batch_size', type=int, default=1, help='The size of batch size')
-    parser.add_argument('--print_freq', type=int, default=1000, help='The number of image print freq')
-    parser.add_argument('--save_freq', type=int, default=100000, help='The number of model save freq')
-    parser.add_argument('--decay_flag', type=str2bool, default=True, help='The decay_flag')
+    parser.add_argument('--print_freq', type=int, default=100, help='The number of image print freq')
+    parser.add_argument('--save_freq', type=int, default=500, help='The number of model save freq')
+    parser.add_argument('--decay_flag', type=bool, default=True, help='The decay_flag')
 
     parser.add_argument('--lr', type=float, default=0.0001, help='The learning rate')
     parser.add_argument('--weight_decay', type=float, default=0.0001, help='The weight decay')
@@ -34,8 +35,8 @@ def parse_args():
 
     parser.add_argument('--result_dir', type=str, default='results', help='Directory name to save the results')
     parser.add_argument('--device', type=str, default='cuda', choices=['cpu', 'cuda'], help='Set gpu mode; [cpu, cuda]')
-    parser.add_argument('--benchmark_flag', type=str2bool, default=False)
-    parser.add_argument('--resume', type=str2bool, default=False)
+    parser.add_argument('--benchmark_flag', type=bool, default=False)
+    parser.add_argument('--resume', type=bool, default=False)
 
     return check_args(parser.parse_args())
 
@@ -65,7 +66,8 @@ def main():
     args = parse_args()
     if args is None:
       exit()
-    place = fluid.CUDAPlace(0) if args.use_gpu else fluid.CPUPlace()
+    place = fluid.CUDAPlace(0)
+    # place = fluid.CPUPlace()
     with fluid.dygraph.guard(place):
         # open session
         gan = UGATIT(args)
@@ -77,9 +79,9 @@ def main():
             gan.train()
             print(" [*] Training finished!")
 
-        # if args.phase == 'test' :
-        #     gan.test()
-        #     print(" [*] Test finished!")
+        if args.phase == 'test' :
+            gan.test()
+            print(" [*] Test finished!")
 
 if __name__ == '__main__':
     main()

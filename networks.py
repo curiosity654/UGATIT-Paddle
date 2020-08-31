@@ -3,28 +3,29 @@ import paddle.fluid.dygraph as dygraph
 import paddle.fluid.layers as layers
 # from paddle.fluid.layers import relu, tanh, resize_nearest, pad2d, unsqueeze, adaptive_max_pool2d, reshape, concat, reduce_sum, create_parameter, reduce_mean, sqrt
 from paddle.fluid.dygraph import Conv2D, Pool2D, InstanceNorm, LayerNorm, Linear, Sequential
+import paddle.fluid.dygraph.nn as nn
+import cv2
+import os
+from utils import *
 
-def var(input, axis=None, keepdim=False, unbiased=True, out=None, name=None):
-    dtype = convert_dtype(input.dtype)
-    if dtype not in ["float32", "float64"]:
-        raise ValueError("Layer tensor.var() only supports floating-point "
-                         "dtypes, but received {}.".format(dtype))
+debug = False
+print_shape = False
+debug_img = False
+debug_img_num = 10
+debug_img_cnt = 0
+
+def var(input, axis=None, keep_dim=False, unbiased=True, out=None, name=None):
     rank = len(input.shape)
     axes = axis if axis != None and axis != [] else range(rank)
     axes = [e if e >= 0 else e + rank for e in axes]
-    inp_shape = input.shape if in_dygraph_mode() else layers.shape(input)
+    inp_shape = input.shape
     mean = layers.reduce_mean(input, dim=axis, keep_dim=True, name=name)
-    tmp = layers.reduce_mean(
-        (input - mean)**2, dim=axis, keep_dim=keepdim, name=name)
+    tmp = layers.reduce_mean((input - mean)**2, dim=axis, keep_dim=keep_dim, name=name)
 
     if unbiased:
         n = 1
         for i in axes:
             n *= inp_shape[i]
-        if not in_dygraph_mode():
-            n = layers.cast(n, dtype)
-            zero_const = layers.fill_constant(shape=[1], dtype=dtype, value=0.0)
-            factor = where(n > 1.0, n / (n - 1.0), zero_const)
         else:
             factor = n / (n - 1.0) if n > 1.0 else 0.0
         tmp *= factor
@@ -33,6 +34,34 @@ def var(input, axis=None, keepdim=False, unbiased=True, out=None, name=None):
         return out
     else:
         return tmp
+
+def debug_print(str):
+    if debug:
+        print(str)
+
+def shape_print(str):
+    if print_shape:
+        print(str)
+
+def debug_save_img(img, layer):
+    pass
+    # global debug_img_cnt
+    # if debug_img and debug_img_cnt < debug_img_num:
+    #     out = tensor2numpy(denorm(img[0]))
+    #     if out.shape[0] == 3:
+    #         out = RGB2BGR(out)
+    #     debug_img_cnt += 1
+    #     cv2.imwrite(os.path.join('debug'+str(debug_img_cnt), layer+'.png'), out)
+
+class Debug(dygraph.Layer):
+    def __init__(self, info):
+        super(Debug, self).__init__()
+        self.info = info
+
+    def forward(self, input):
+        if debug:
+            print(self.info)
+        return input
 
 class ReLU(dygraph.Layer):
     def __init__(self, inplace=False):
@@ -55,10 +84,10 @@ class LeakyReLU(dygraph.Layer):
 
     def forward(self, input):
         if self.inplace:
-            input.set_value(layers.leaky_relu(input, alpha))
+            input.set_value(layers.leaky_relu(input, self.alpha))
             return input
         else:
-            y = layers.leaky_relu(input, alpha)
+            y = layers.leaky_relu(input, self.alpha)
             return y
 
 class Tanh(dygraph.Layer):
@@ -92,14 +121,14 @@ class ReflectionPad2d(dygraph.Layer):
         y = layers.pad2d(input, paddings=self.padding, mode='reflect')
         return y
 
-class Spectralnorm(dygraph.Layer):
+class SpectralNorm(dygraph.Layer):
     def __init__(self,
                  layer,
                  dim=0,
                  power_iters=1,
                  eps=1e-12,
                  dtype='float32'):
-        super(Spectralnorm, self).__init__()
+        super(SpectralNorm, self).__init__()
         self.spectral_norm = nn.SpectralNorm(layer.weight.shape, dim, power_iters, eps, dtype)
         self.dim = dim
         self.power_iters = power_iters
@@ -116,13 +145,14 @@ class Spectralnorm(dygraph.Layer):
         out = self.layer(x)
         return out
 
-def bce_Loss(input, target):
-    loss = paddle.fluid.layers.sigmoid_cross_entropy_with_logits(
+# OK
+def bce_loss(input, target):
+    loss = layers.sigmoid_cross_entropy_with_logits(
     x=input,
     label=target,
     ignore_index=-1,
     normalize=True)
-    loss = paddle.fluid.layers.reduce_sum(loss)
+    loss = layers.reduce_sum(loss)
     return loss
 
 class ResnetGenerator(dygraph.Layer):
@@ -146,8 +176,7 @@ class ResnetGenerator(dygraph.Layer):
 
         DownBlock = []
         # 3 ReflectionPad2d 抵消了紧接着的7*7Conv层
-        #TODO 此处由于Paddle的pad2d在fluid.layer中，不能作为对象定义，比较麻烦，因此暂时使用普通padding
-        DownBlock += [ReflectionPad2d([1,1,1,1]),
+        DownBlock += [ReflectionPad2d([3,3,3,3]),
                       Conv2D(input_nc, ngf, filter_size=7, stride=1, padding=0, bias_attr=False),
                       InstanceNorm(ngf),
                       #TODO paddle没有单独的ReLU对象，暂时用PReLU代替，后期将const改成0
@@ -198,49 +227,89 @@ class ResnetGenerator(dygraph.Layer):
         for i in range(n_downsampling):
             mult = 2**(n_downsampling - i)
             UpBlock2 += [Upsample(scale_factor=2),
+                         Debug('Upsample Pass'),
                          ReflectionPad2d([1,1,1,1]),
+                         Debug('ReflectionPad2d Pass'),
                          Conv2D(ngf * mult, int(ngf * mult / 2), filter_size=3, stride=1, padding=0, bias_attr=False),
+                         Debug('Conv2D Pass'),
                          ILN(int(ngf * mult / 2)),
+                         Debug('ILN Pass'),
                          ReLU(True)]
 
         UpBlock2 += [ReflectionPad2d([3,3,3,3]),
                      Conv2D(ngf, output_nc, filter_size=7, stride=1, padding=0, bias_attr=False),
-                     Tanh(False)]
+                     Tanh()]
 
         self.DownBlock = Sequential(*DownBlock)
         self.FC = Sequential(*FC)
         self.UpBlock2 = Sequential(*UpBlock2)
 
     def forward(self, input):
+        shape_print('Generator')
+        shape_print('input shape:' + str(input.shape))
         x = self.DownBlock(input)
-        print('x: '+str(x.shape))
+        shape_print('downblock shape:' + str(x.shape))
+        debug_print('DownBlock Pass')
+        debug_save_img(x, 'DownBlock')
         gap = layers.adaptive_pool2d(x, 1, pool_type='avg')
+        shape_print('gap shape:' + str(gap.shape))
         gap_logit = self.gap_fc(layers.reshape(gap, [x.shape[0], -1]))
+        shape_print('gap_logit shape:' + str(gap_logit.shape))
+        debug_print('GAP logit Pass')
         gap_weight = list(self.gap_fc.parameters())[0]
+        # gap_weight = layers.transpose(gap_weight, [1,0])
+        gap_weight = layers.reshape(gap_weight, [x.shape[0],-1])
+        shape_print('gap_weight shape:' + str(gap_weight.shape))
+        debug_print('GAP weight Pass')
         gap = x * layers.unsqueeze(layers.unsqueeze(gap_weight, 2), 3)
+        shape_print('gap shape:' + str(gap.shape))
+        debug_print('GAP Pass')
 
         gmp = layers.adaptive_pool2d(x, 1, pool_type='max')
         gmp_logit = self.gmp_fc(layers.reshape(gmp, [x.shape[0], -1]))
+        shape_print('gmp_logit shape:' + str(gmp_logit.shape))
+        debug_print('GMP logit Pass')
         gmp_weight = list(self.gmp_fc.parameters())[0]
+        # gmp_weight = layers.transpose(gmp_weight, [1,0])
+        gmp_weight = layers.reshape(gmp_weight, [x.shape[0],-1])
+        shape_print('gmp_weight shape:' + str(gmp_weight.shape))
+        debug_print('GMP weight Pass')
         gmp = x * layers.unsqueeze(layers.unsqueeze(gmp_weight, 2), 3)
+        shape_print('gmp shape:' + str(gmp.shape))
+        debug_print('GMP Pass')
         
         cam_logit = layers.concat([gap_logit, gmp_logit], 1)
+        shape_print('cam logit shape:' + str(cam_logit.shape))
+        debug_print('CAM logit Pass')
         x = layers.concat([gap, gmp], 1)
+        shape_print('x shape:' + str(x.shape))
         x = self.relu(self.conv1x1(x))
+        shape_print('x shape:' + str(x.shape))
 
-        heatmap = layers.reduce_sum(x, dim=1, keepdim=True)
+        heatmap = layers.reduce_sum(x, dim=1, keep_dim=True)
+        shape_print('heatmap shape:' + str(heatmap.shape))
 
         if self.light:
             x_ = layers.adaptive_pool2d(x, 1, pool_type='avg')
             x_ = self.FC(layers.reshape(x_, [x_.shape[0], -1]))
+            shape_print('FC shape:' + str(x_.shape))
+            debug_print('FC Pass')
         else:
             x_ = self.FC(layers.reshape(x, [x.shape[0], -1]))
+            shape_print('FC shape:' + str(x_.shape))
         gamma, beta = self.gamma(x_), self.beta(x_)
+        shape_print('gamma shape:' + str(gamma.shape))
+        shape_print('beta shape:' + str(beta.shape))
 
 
         for i in range(self.n_blocks):
             x = getattr(self, 'UpBlock1_' + str(i+1))(x, gamma, beta)
+            debug_save_img(x, 'UpBlock1_' + str(i+1))
+            shape_print('UpBlock1_' + str(i+1) + 'shape:' + str(x.shape))
+            debug_print('UpBlock1_' + str(i+1) + 'Pass')
         out = self.UpBlock2(x)
+        debug_save_img(out, 'out')
+        debug_print('UpBlock2 Pass')
 
         return out, cam_logit, heatmap
 
@@ -251,7 +320,7 @@ class ResnetBlock(dygraph.Layer):
         conv_block += [ReflectionPad2d([1,1,1,1]),
                        Conv2D(dim, dim, filter_size=3, stride=1, padding=0, bias_attr=use_bias),
                        InstanceNorm(dim),
-                       ReLU(True)]
+                       ReLU(False)]
 
         #TODO: 这里加一个不带ReLU的有何意义
         conv_block += [ReflectionPad2d([1,1,1,1]),
@@ -271,7 +340,7 @@ class ResnetAdaILNBlock(dygraph.Layer):
         self.pad1 = ReflectionPad2d([1,1,1,1])
         self.conv1 = Conv2D(dim, dim, filter_size=3, stride=1, padding=0, bias_attr=use_bias)
         self.norm1 = adaILN(dim)
-        self.relu1 = ReLU(True)
+        self.relu1 = ReLU(False)
 
         self.pad2 = ReflectionPad2d([1,1,1,1])
         self.conv2 = Conv2D(dim, dim, filter_size=3, stride=1, padding=0, bias_attr=use_bias)
@@ -296,11 +365,11 @@ class adaILN(dygraph.Layer):
         self.rho = layers.create_parameter(shape=[1, num_features, 1, 1], dtype='float32', default_initializer=fluid.initializer.Constant(0.9))
 
     def forward(self, input, gamma, beta):
-        in_mean, in_var = reduce_mean(input, dim=[2, 3], keepdim=True), var(input, axis=[2, 3], keepdim=True)
+        in_mean, in_var = layers.reduce_mean(input, dim=[2, 3], keep_dim=True), var(input, axis=[2, 3], keep_dim=True)
         out_in = (input - in_mean) / layers.sqrt(in_var + self.eps)
-        ln_mean, ln_var = reduce_mean(input, dim=[1, 2, 3], keepdim=True), var(input, axis=[1, 2, 3], keepdim=True)
+        ln_mean, ln_var = layers.reduce_mean(input, dim=[1, 2, 3], keep_dim=True), var(input, axis=[1, 2, 3], keep_dim=True)
         out_ln = (input - ln_mean) / layers.sqrt(ln_var + self.eps)
-        out = layers.expand(self.rho, [input.shape[0], -1, -1, -1]) * out_in + (1-layers.expand[input.shape[0], -1, -1, -1]) * out_in
+        out = layers.expand(self.rho, [input.shape[0], 1, 1, 1]) * out_in + (1-layers.expand(self.rho, [input.shape[0], 1, 1, 1])) * out_ln
         out = out * layers.unsqueeze(layers.unsqueeze(gamma, 2), 3) + layers.unsqueeze(layers.unsqueeze(beta, 2), 3)
 
         return out
@@ -315,12 +384,19 @@ class ILN(dygraph.Layer):
         self.beta = layers.create_parameter(shape=[1, num_features, 1, 1], dtype='float32', default_initializer=fluid.initializer.Constant(0.0))
 
     def forward(self, input):
-        in_mean, in_var = reduce_mean(input, dim=[2, 3], keepdim=True), var(input, axis=[2, 3], keepdim=True)
+        # print('-----rho-----:', self.rho)
+        in_mean, in_var = layers.reduce_mean(input, dim=[2, 3], keep_dim=True), var(input, axis=[2, 3], keep_dim=True)
+        debug_print('reduce_mean')
         out_in = (input - in_mean) / layers.sqrt(in_var + self.eps)
-        ln_mean, ln_var = reduce_mean(input, dim=[1, 2, 3], keepdim=True), var(input, axis=[1, 2, 3], keepdim=True)
+        debug_print('sqrt')
+        ln_mean, ln_var = layers.reduce_mean(input, dim=[1, 2, 3], keep_dim=True), var(input, axis=[1, 2, 3], keep_dim=True)
+        debug_print('reduce_mean')
         out_ln = (input - ln_mean) / layers.sqrt(ln_var + self.eps)
-        out = layers.expand(self.rho, [input.shape[0], -1, -1, -1]) * out_in + (1-layers.expand[input.shape[0], -1, -1, -1]) * out_in
-        out = out * layers.expand(self.gamma, [input.shape[0], -1, -1, -1]) + layers.expand(self.beta, [input.shape[0], -1, -1, -1])
+        debug_print('sqrt')
+        out = layers.expand(self.rho, [input.shape[0], 1, 1, 1]) * out_in + (1-layers.expand(self.rho, [input.shape[0], 1, 1, 1])) * out_ln
+        debug_print('expand')
+        out = out * layers.expand(self.gamma, [input.shape[0], 1, 1, 1]) + layers.expand(self.beta, [input.shape[0], 1, 1, 1])
+        debug_print('expand')
 
         return out
 
@@ -328,69 +404,85 @@ class Discriminator(dygraph.Layer):
     def __init__(self, input_nc, ndf=64, n_layers=5):
         super(Discriminator, self).__init__()
         model = [ReflectionPad2d([1,1,1,1]),
-                # TODO 谱归一化
-                 Conv2D(input_nc, ndf, filter_size=4, stride=2, padding=0, bias_attr=True),
-                 LeakyReLU(0.2, True)]
+                # SpectralNorm(
+                Conv2D(input_nc, ndf, filter_size=4, stride=2, padding=0, bias_attr=True),
+                # ),
+                LeakyReLU(0.2, False)]
 
         for i in range(1, n_layers - 2):
             mult = 2 ** (i - 1)
             model += [ReflectionPad2d([1,1,1,1]),
                       Conv2D(ndf * mult, ndf * mult * 2, filter_size=4, stride=2, padding=0, bias_attr=True),
-                      LeakyReLU(0.2, True)]
+                      LeakyReLU(0.2, False)]
 
         mult = 2 ** (n_layers - 2 - 1)
         model += [ReflectionPad2d([1,1,1,1]),
+                #   SpectralNorm(
                   Conv2D(ndf * mult, ndf * mult * 2, filter_size=4, stride=1, padding=0, bias_attr=True),
-                  LeakyReLU(0.2, True)]
+                #   ),
+                  LeakyReLU(0.2, False)]
 
         # Class Activation Map
         mult = 2 ** (n_layers - 2)
         self.gap_fc = Linear(ndf * mult, 1, bias_attr=False)
         self.gmp_fc = Linear(ndf * mult, 1, bias_attr=False)
         self.conv1x1 = Conv2D(ndf * mult * 2, ndf * mult, filter_size=1, stride=1, bias_attr=True)
-        self.leaky_relu = LeakyReLU(0.2, True)
+        self.leaky_relu = LeakyReLU(0.2, False)
 
         self.pad = ReflectionPad2d([1,1,1,1])
         self.conv = Conv2D(ndf * mult, 1, filter_size=4, stride=1, padding=0, bias_attr=False)
+        self.conv = Conv2D(ndf * mult, 1, filter_size=4, stride=1, padding=0, bias_attr=False)
+        # SpectralNorm(
+            # Conv2D(ndf * mult, 1, filter_size=4, stride=1, padding=0, bias_attr=False),
+            # )
 
         self.model = Sequential(*model)
 
     def forward(self, input):
+        shape_print('Discriminator')
+        shape_print('input shape:' + str(input.shape))
         x = self.model(input)
-
+        shape_print('x shape:' + str(x.shape))
         gap = layers.adaptive_pool2d(x, 1, pool_type='avg')
+        shape_print('gap shape:' + str(gap.shape))
         gap_logit = self.gap_fc(layers.reshape(gap, [x.shape[0], -1]))
+        shape_print('gap_logit shape:' + str(gap_logit.shape))
         gap_weight = list(self.gap_fc.parameters())[0]
+        # gap_weight = layers.transpose(gap_weight, [1,0])
+        gap_weight = layers.reshape(gap_weight, [x.shape[0],-1])
+        shape_print('gap_weight shape:' + str(gap_weight.shape))
         gap = x * layers.unsqueeze(layers.unsqueeze(gap_weight, 2), 3)
+        shape_print('gap shape:' + str(gap.shape))
 
         gmp = layers.adaptive_pool2d(x, 1, pool_type='max')
-        gap_logit = self.gmp_fc(layers.reshape(gmp, [x.shape[0], -1]))
+        shape_print('gmp shape:' + str(gmp.shape))
+        gmp_logit = self.gmp_fc(layers.reshape(gmp, [x.shape[0], -1]))
+        shape_print('gap_logit shape:' + str(gap_logit.shape))
         gmp_weight = list(self.gmp_fc.parameters())[0]
+        # gmp_weight = layers.transpose(gmp_weight, [1,0])
+        gmp_weight = layers.reshape(gmp_weight, [x.shape[0],-1])
+        shape_print('gmp_weight shape:' + str(gmp_weight.shape))
         gmp = x * layers.unsqueeze(layers.unsqueeze(gmp_weight, 2), 3)
+        shape_print('gmp shape:' + str(gmp.shape))
 
         cam_logit = layers.concat([gap_logit, gmp_logit], 1)
+        shape_print('cam_logit shape:' + str(cam_logit.shape))
         x = layers.concat([gap, gmp], 1)
+        shape_print('x shape:' + str(x.shape))
         x = self.leaky_relu(self.conv1x1(x))
+        shape_print('x shape:' + str(x.shape))
 
-        heatmap = layers.reduce_sum(x, dim=1, keepdim=True)
+        heatmap = layers.reduce_sum(x, dim=1, keep_dim=True)
+        shape_print('heatmap shape:' + str(heatmap.shape))
 
         x = self.pad(x)
+        shape_print('x shape:' + str(x.shape))
         out = self.conv(x)
+        shape_print('out shape:' + str(out.shape))
 
         return out, cam_logit, heatmap
 
-
-class RhoClipper(object):
-
-    def __init__(self, min, max):
-        self.clip_min = min
-        self.clip_max = max
-        assert min < max
-
-    def __call__(self, module):
-
-        if hasattr(module, 'rho'):
-            # TODO 不确定这样直接在param上应用clip是否可以
-            w = module.rho
-            w = layers.clip(w, self.clip_min, self.clip_max)
-            module.rho = w
+def clip_rho(net, vmin=0, vmax=1):
+    for name, param in net.named_parameters():
+        if 'rho' in name:
+            param.set_value(fluid.layers.clip(param, vmin, vmax))
